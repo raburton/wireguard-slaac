@@ -236,6 +236,12 @@ static void pretty_print(struct wgdevice *device)
 				terminal_printf("%s" TERMINAL_FG_CYAN "/" TERMINAL_RESET "%u%s", ip(allowedip), allowedip->cidr, allowedip->next_allowedip ? ", " : "\n");
 		} else
 			terminal_printf("(none)\n");
+		terminal_printf("  " TERMINAL_BOLD "learnable ips" TERMINAL_RESET ": ");
+		if (peer->first_learnableip) {
+			for (allowedip = peer->first_learnableip; allowedip; allowedip = allowedip->next_allowedip)
+				terminal_printf("%s" TERMINAL_FG_CYAN "/" TERMINAL_RESET "%u%s", ip(allowedip), allowedip->cidr, allowedip->next_allowedip ? ", " : "\n");
+		} else
+			terminal_printf("(none)\n");
 		if (peer->last_handshake_time.tv_sec)
 			terminal_printf("  " TERMINAL_BOLD "latest handshake" TERMINAL_RESET ": %s\n", ago(&peer->last_handshake_time));
 		if (peer->rx_bytes || peer->tx_bytes) {

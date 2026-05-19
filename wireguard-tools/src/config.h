@@ -16,6 +16,7 @@ struct config_ctx {
 	struct wgdevice *device;
 	struct wgpeer *last_peer;
 	struct wgallowedip *last_allowedip;
+	struct wgallowedip *last_learnableip;
 	bool is_peer_section, is_device_section;
 };
 

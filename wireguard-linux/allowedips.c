@@ -5,12 +5,17 @@
 
 #include "allowedips.h"
 #include "peer.h"
+#include "device.h"
+#include "queueing.h"
 
 enum { MAX_ALLOWEDIPS_DEPTH = 129 };
 
+void wg_allowedips_learn_worker(struct work_struct *work);
+void wg_allowedips_gc_worker(struct work_struct *work);
+
 static struct kmem_cache *node_cache;
 
-static void swap_endian(u8 *dst, const u8 *src, u8 bits)
+void swap_endian(u8 *dst, const u8 *src, u8 bits)
 {
 	if (bits == 32) {
 		*(u32 *)dst = be32_to_cpu(*(const __be32 *)src);
@@ -114,8 +119,10 @@ static struct allowedips_node *find_node(struct allowedips_node *trie, u8 bits,
 	struct allowedips_node *node = trie, *found = NULL;
 
 	while (node && prefix_matches(node, key, bits)) {
-		if (rcu_access_pointer(node->peer))
+		if (rcu_access_pointer(node->peer)) {
 			found = node;
+			WRITE_ONCE(found->last_used, jiffies);
+		}
 		if (node->cidr == bits)
 			break;
 		node = rcu_dereference_bh(node->bit[choose(node, key)]);
@@ -178,8 +185,8 @@ static inline void choose_and_connect_node(struct allowedips_node *parent, struc
 	connect_node(&parent->bit[bit], bit, node);
 }
 
-static int add(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
-	       u8 cidr, struct wg_peer *peer, struct mutex *lock)
+int add(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
+	       u8 cidr, struct wg_peer *peer, struct list_head *peer_list, bool learned, struct mutex *lock)
 {
 	struct allowedips_node *node, *parent, *down, *newnode;
 
@@ -191,14 +198,29 @@ static int add(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
 		if (unlikely(!node))
 			return -ENOMEM;
 		RCU_INIT_POINTER(node->peer, peer);
-		list_add_tail(&node->peer_list, &peer->allowedips_list);
+		node->is_learned = learned;
+		if (learned)
+			atomic_inc(&peer->learned_ip_count);
+		list_add_tail(&node->peer_list, peer_list);
 		copy_and_assign_cidr(node, key, cidr, bits);
+		node->last_used = jiffies;
 		connect_node(trie, 2, node);
 		return 0;
 	}
 	if (node_placement(*trie, key, cidr, bits, &node, lock)) {
+		struct wg_peer *old_peer = rcu_dereference_protected(node->peer, lockdep_is_held(lock));
+
+		if (learned && old_peer) {
+			if (old_peer != peer || !node->is_learned)
+				return 0;
+		}
+		if (node->is_learned && old_peer)
+			atomic_dec(&old_peer->learned_ip_count);
 		rcu_assign_pointer(node->peer, peer);
-		list_move_tail(&node->peer_list, &peer->allowedips_list);
+		node->is_learned = learned;
+		if (learned)
+			atomic_inc(&peer->learned_ip_count);
+		list_move_tail(&node->peer_list, peer_list);
 		return 0;
 	}
 
@@ -206,8 +228,12 @@ static int add(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
 	if (unlikely(!newnode))
 		return -ENOMEM;
 	RCU_INIT_POINTER(newnode->peer, peer);
-	list_add_tail(&newnode->peer_list, &peer->allowedips_list);
+	newnode->is_learned = learned;
+	if (learned)
+		atomic_inc(&peer->learned_ip_count);
+	list_add_tail(&newnode->peer_list, peer_list);
 	copy_and_assign_cidr(newnode, key, cidr, bits);
+	newnode->last_used = jiffies;
 
 	if (!node) {
 		down = rcu_dereference_protected(*trie, lockdep_is_held(lock));
@@ -233,6 +259,8 @@ static int add(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
 
 	node = kmem_cache_zalloc(node_cache, GFP_KERNEL);
 	if (unlikely(!node)) {
+		if (newnode->is_learned)
+			atomic_dec(&peer->learned_ip_count);
 		list_del(&newnode->peer_list);
 		kmem_cache_free(node_cache, newnode);
 		return -ENOMEM;
@@ -249,10 +277,17 @@ static int add(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
 	return 0;
 }
 
-static void remove_node(struct allowedips_node *node, struct mutex *lock)
+static void __wg_allowedips_remove_node(struct allowedips *table,
+					struct allowedips_node *node,
+					struct mutex *lock)
 {
 	struct allowedips_node *child, **parent_bit, *parent;
+	struct wg_peer *peer;
 	bool free_parent;
+
+	peer = rcu_dereference_protected(node->peer, lockdep_is_held(lock));
+	if (node->is_learned && peer)
+		atomic_dec(&peer->learned_ip_count);
 
 	list_del_init(&node->peer_list);
 	RCU_INIT_POINTER(node->peer, NULL);
@@ -267,10 +302,8 @@ static void remove_node(struct allowedips_node *node, struct mutex *lock)
 	parent = (void *)parent_bit -
 			offsetof(struct allowedips_node, bit[node->parent_bit_packed & 1]);
 	free_parent = !rcu_access_pointer(node->bit[0]) && !rcu_access_pointer(node->bit[1]) &&
-			(node->parent_bit_packed & 3) <= 1 && !rcu_access_pointer(parent->peer);
-	if (free_parent)
-		child = rcu_dereference_protected(parent->bit[!(node->parent_bit_packed & 1)],
-						  lockdep_is_held(lock));
+			(node->parent_bit_packed & 3) <= 1 &&
+			!rcu_access_pointer(parent->peer);
 	call_rcu(&node->rcu, node_free_rcu);
 	if (!free_parent)
 		return;
@@ -280,8 +313,9 @@ static void remove_node(struct allowedips_node *node, struct mutex *lock)
 	call_rcu(&parent->rcu, node_free_rcu);
 }
 
-static int remove(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
-		  u8 cidr, struct wg_peer *peer, struct mutex *lock)
+static int remove(struct allowedips *table, struct allowedips_node __rcu **trie,
+		  u8 bits, const u8 *key, u8 cidr, struct wg_peer *peer,
+		  struct mutex *lock)
 {
 	struct allowedips_node *node;
 
@@ -290,8 +324,8 @@ static int remove(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
 	if (!rcu_access_pointer(*trie) || !node_placement(*trie, key, cidr, bits, &node, lock) ||
 	    peer != rcu_access_pointer(node->peer))
 		return 0;
-
-	remove_node(node, lock);
+	++table->seq; /* Increment seq for removal */
+	__wg_allowedips_remove_node(table, node, lock);
 	return 0;
 }
 
@@ -332,7 +366,7 @@ int wg_allowedips_insert_v4(struct allowedips *table, const struct in_addr *ip,
 
 	++table->seq;
 	swap_endian(key, (const u8 *)ip, 32);
-	return add(&table->root4, 32, key, cidr, peer, lock);
+	return add(&table->root4, 32, key, cidr, peer, &peer->allowedips_list, false, lock);
 }
 
 int wg_allowedips_insert_v6(struct allowedips *table, const struct in6_addr *ip,
@@ -343,7 +377,7 @@ int wg_allowedips_insert_v6(struct allowedips *table, const struct in6_addr *ip,
 
 	++table->seq;
 	swap_endian(key, (const u8 *)ip, 128);
-	return add(&table->root6, 128, key, cidr, peer, lock);
+	return add(&table->root6, 128, key, cidr, peer, &peer->allowedips_list, false, lock);
 }
 
 int wg_allowedips_remove_v4(struct allowedips *table, const struct in_addr *ip,
@@ -354,7 +388,7 @@ int wg_allowedips_remove_v4(struct allowedips *table, const struct in_addr *ip,
 
 	++table->seq;
 	swap_endian(key, (const u8 *)ip, 32);
-	return remove(&table->root4, 32, key, cidr, peer, lock);
+	return remove(table, &table->root4, 32, key, cidr, peer, lock);
 }
 
 int wg_allowedips_remove_v6(struct allowedips *table, const struct in6_addr *ip,
@@ -365,7 +399,7 @@ int wg_allowedips_remove_v6(struct allowedips *table, const struct in6_addr *ip,
 
 	++table->seq;
 	swap_endian(key, (const u8 *)ip, 128);
-	return remove(&table->root6, 128, key, cidr, peer, lock);
+	return remove(table, &table->root6, 128, key, cidr, peer, lock);
 }
 
 void wg_allowedips_remove_by_peer(struct allowedips *table,
@@ -377,7 +411,116 @@ void wg_allowedips_remove_by_peer(struct allowedips *table,
 		return;
 	++table->seq;
 	list_for_each_entry_safe(node, tmp, &peer->allowedips_list, peer_list)
-		remove_node(node, lock);
+		__wg_allowedips_remove_node(table, node, lock);
+}
+
+void wg_allowedips_gc_worker(struct work_struct *work)
+{
+	struct wg_device *wg = container_of(work, struct wg_device, allowedips_gc_work.work);
+	struct wg_peer *peer;
+	struct allowedips_node *node, *tmp;
+	const unsigned long timeout = 24 * 60 * 60 * HZ;
+
+	mutex_lock(&wg->device_update_lock);
+	++wg->peer_allowedips.seq;
+	list_for_each_entry(peer, &wg->peer_list, peer_list) {
+		list_for_each_entry_safe(node, tmp, &peer->allowedips_list, peer_list) {
+			if (node->is_learned &&
+			    time_is_before_jiffies(node->last_used + timeout)) {
+				pr_debug("%s: Expiring stale IP %pI6 from peer %llu\n",
+					 wg->dev->name, node->bits, peer->internal_id);
+				__wg_allowedips_remove_node(&wg->peer_allowedips, node, &wg->device_update_lock);
+			}
+		}
+	}
+	mutex_unlock(&wg->device_update_lock);
+	schedule_delayed_work(&wg->allowedips_gc_work, 3600 * HZ);
+}
+
+void wg_allowedips_learn_worker(struct work_struct *work)
+{
+	struct wg_peer *peer = container_of(work, struct wg_peer, learn_ip_work);
+	struct wg_device *wg = peer->device;
+	struct in6_addr ip6;
+	u8 key[16] __aligned(__alignof(u64));
+
+	for (;;) {
+		if (unlikely(READ_ONCE(peer->is_dead)))
+			break;
+
+		spin_lock_bh(&peer->learned_ip_queue_lock);
+		if (peer->learned_ip_queue_head == peer->learned_ip_queue_tail) {
+			spin_unlock_bh(&peer->learned_ip_queue_lock);
+			break;
+		}
+		ip6 = peer->learned_ip_queue[peer->learned_ip_queue_tail];
+		peer->learned_ip_queue_tail = (peer->learned_ip_queue_tail + 1) % ARRAY_SIZE(peer->learned_ip_queue);
+		spin_unlock_bh(&peer->learned_ip_queue_lock);
+
+		mutex_lock(&wg->device_update_lock);
+
+		if (unlikely(READ_ONCE(peer->is_dead))) {
+			mutex_unlock(&wg->device_update_lock);
+			break;
+		}
+
+		if (atomic_read(&peer->learned_ip_count) >= 16) {
+			struct allowedips_node *node, *victim = NULL;
+			unsigned long oldest = jiffies;
+
+			list_for_each_entry(node, &peer->allowedips_list, peer_list) {
+				if (node->is_learned && (!victim || time_before(node->last_used, oldest))) {
+					oldest = node->last_used;
+					victim = node;
+				}
+			}
+			if (victim) {
+				++wg->peer_allowedips.seq;
+				__wg_allowedips_remove_node(&wg->peer_allowedips, victim, &wg->device_update_lock);
+			}
+		}
+
+		swap_endian(key, ip6.s6_addr, 128);
+		if (add(&wg->peer_allowedips.root6, 128, key, 128, peer, &peer->allowedips_list, true, &wg->device_update_lock) == 0)
+			++wg->peer_allowedips.seq;
+		mutex_unlock(&wg->device_update_lock);
+	}
+
+	wg_peer_put(peer);
+}
+
+static void wg_allowedips_learn(struct allowedips *table, struct wg_peer *peer,
+				struct sk_buff *skb)
+{
+	struct wg_peer *learnable_range_peer = NULL;
+	unsigned int next_head;
+
+	if (skb->protocol == htons(ETH_P_IPV6)) {
+		/* Check if the source IPv6 address is within any of the peer's LearnableIPs ranges.
+		 * The 'lookup' function returns a strong reference, so we must put it if found.
+		 */
+		learnable_range_peer = lookup(peer->learnable_ips.root6, 128, &ipv6_hdr(skb)->saddr);
+
+		if (!learnable_range_peer)
+			return;
+
+		/* The IP is within a learnable range. Release the reference acquired by lookup. */
+		wg_peer_put(learnable_range_peer);
+
+		spin_lock_bh(&peer->learned_ip_queue_lock);
+		next_head = (peer->learned_ip_queue_head + 1) % ARRAY_SIZE(peer->learned_ip_queue);
+		if (next_head != peer->learned_ip_queue_tail) {
+			peer->learned_ip_queue[peer->learned_ip_queue_head] = ipv6_hdr(skb)->saddr;
+			peer->learned_ip_queue_head = next_head;
+			pr_debug_ratelimited("%s: Queued new source IPv6 for peer %llu\n",
+					     peer->device->dev->name, peer->internal_id);
+
+			wg_peer_get(peer);
+			if (!queue_work(peer->device->handshake_send_wq, &peer->learn_ip_work))
+				wg_peer_put(peer);
+		}
+		spin_unlock_bh(&peer->learned_ip_queue_lock);
+	}
 }
 
 int wg_allowedips_read_node(struct allowedips_node *node, u8 ip[16], u8 *cidr)
@@ -407,11 +550,33 @@ struct wg_peer *wg_allowedips_lookup_dst(struct allowedips *table,
 struct wg_peer *wg_allowedips_lookup_src(struct allowedips *table,
 					 struct sk_buff *skb)
 {
+	struct wg_peer *peer = NULL;
+	struct wg_peer *actual_peer = NULL;
+
+	if (PACKET_CB(skb)->keypair)
+		actual_peer = PACKET_PEER(skb);
+
 	if (skb->protocol == htons(ETH_P_IP))
-		return lookup(table->root4, 32, &ip_hdr(skb)->saddr);
+		peer = lookup(table->root4, 32, &ip_hdr(skb)->saddr);
 	else if (skb->protocol == htons(ETH_P_IPV6))
-		return lookup(table->root6, 128, &ipv6_hdr(skb)->saddr);
-	return NULL;
+		peer = lookup(table->root6, 128, &ipv6_hdr(skb)->saddr);
+
+	if (actual_peer && skb->protocol == htons(ETH_P_IPV6) && peer != actual_peer) {
+		if (!peer) {
+			wg_allowedips_learn(table, actual_peer, skb);
+			rcu_read_lock_bh();
+			actual_peer = wg_peer_get_maybe_zero(actual_peer);
+			rcu_read_unlock_bh();
+			return actual_peer;
+		}
+		/* If the IP is already assigned to a different peer, we block the
+		 * learning attempt to prevent hijacking.
+		 */
+		wg_peer_put(peer);
+		return NULL;
+	}
+
+	return peer;
 }
 
 int __init wg_allowedips_slab_init(void)

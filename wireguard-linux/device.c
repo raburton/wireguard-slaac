@@ -253,6 +253,7 @@ static void wg_destruct(struct net_device *dev)
 	/* The final references are cleared in the below calls to destroy_workqueue. */
 	wg_peer_remove_all(wg);
 	destroy_workqueue(wg->handshake_receive_wq);
+	cancel_delayed_work_sync(&wg->allowedips_gc_work);
 	destroy_workqueue(wg->handshake_send_wq);
 	destroy_workqueue(wg->packet_crypt_wq);
 	wg_packet_queue_free(&wg->handshake_queue, true);
@@ -372,6 +373,9 @@ static int wg_newlink(struct net_device *dev,
 	ret = register_netdevice(dev);
 	if (ret < 0)
 		goto err_uninit_ratelimiter;
+
+	INIT_DELAYED_WORK(&wg->allowedips_gc_work, wg_allowedips_gc_worker);
+	schedule_delayed_work(&wg->allowedips_gc_work, 3600 * HZ);
 
 	list_add(&wg->device_list, &device_list);
 

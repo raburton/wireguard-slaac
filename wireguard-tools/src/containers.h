@@ -48,7 +48,8 @@ enum {
 	WGPEER_REPLACE_ALLOWEDIPS = 1U << 1,
 	WGPEER_HAS_PUBLIC_KEY = 1U << 2,
 	WGPEER_HAS_PRESHARED_KEY = 1U << 3,
-	WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL = 1U << 4
+	WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL = 1U << 4,
+	WGPEER_REPLACE_LEARNABLEIPS = 1U << 5
 };
 
 struct wgpeer {
@@ -68,6 +69,7 @@ struct wgpeer {
 	uint16_t persistent_keepalive_interval;
 
 	struct wgallowedip *first_allowedip, *last_allowedip;
+	struct wgallowedip *first_learnableip, *last_learnableip;
 	struct wgpeer *next_peer;
 };
 
@@ -103,6 +105,8 @@ static inline void free_wgdevice(struct wgdevice *dev)
 		return;
 	for (struct wgpeer *peer = dev->first_peer, *np = peer ? peer->next_peer : NULL; peer; peer = np, np = peer ? peer->next_peer : NULL) {
 		for (struct wgallowedip *allowedip = peer->first_allowedip, *na = allowedip ? allowedip->next_allowedip : NULL; allowedip; allowedip = na, na = allowedip ? allowedip->next_allowedip : NULL)
+			free(allowedip);
+		for (struct wgallowedip *allowedip = peer->first_learnableip, *na = allowedip ? allowedip->next_allowedip : NULL; allowedip; allowedip = na, na = allowedip ? allowedip->next_allowedip : NULL)
 			free(allowedip);
 		free(peer);
 	}

@@ -15,11 +15,12 @@ struct wg_peer;
 struct allowedips_node {
 	struct wg_peer __rcu *peer;
 	struct allowedips_node __rcu *bit[2];
-	u8 cidr, bit_at_a, bit_at_b, bitlen;
+	u8 cidr, bit_at_a, bit_at_b, bitlen, is_learned;
 	u8 bits[16] __aligned(__alignof(u64));
 
 	/* Keep rarely used members at bottom to be beyond cache line. */
 	unsigned long parent_bit_packed;
+	unsigned long last_used;
 	union {
 		struct list_head peer_list;
 		struct rcu_head rcu;
@@ -45,6 +46,10 @@ int wg_allowedips_remove_v6(struct allowedips *table, const struct in6_addr *ip,
 void wg_allowedips_remove_by_peer(struct allowedips *table,
 				  struct wg_peer *peer, struct mutex *lock);
 /* The ip input pointer should be __aligned(__alignof(u64))) */
+void swap_endian(u8 *dst, const u8 *src, u8 bits);
+int add(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
+	u8 cidr, struct wg_peer *peer, struct list_head *peer_list,
+	bool learned, struct mutex *lock);
 int wg_allowedips_read_node(struct allowedips_node *node, u8 ip[16], u8 *cidr);
 
 /* These return a strong reference to a peer: */
@@ -52,6 +57,7 @@ struct wg_peer *wg_allowedips_lookup_dst(struct allowedips *table,
 					 struct sk_buff *skb);
 struct wg_peer *wg_allowedips_lookup_src(struct allowedips *table,
 					 struct sk_buff *skb);
+void wg_allowedips_gc_worker(struct work_struct *work);
 
 #ifdef DEBUG
 bool wg_allowedips_selftest(void);

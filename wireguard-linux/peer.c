@@ -15,6 +15,8 @@
 #include <linux/rcupdate.h>
 #include <linux/list.h>
 
+void wg_allowedips_learn_worker(struct work_struct *work);
+
 static struct kmem_cache *peer_cache;
 static atomic64_t peer_counter = ATOMIC64_INIT(0);
 
@@ -47,6 +49,7 @@ struct wg_peer *wg_peer_create(struct wg_device *wg,
 	spin_lock_init(&peer->keypairs.keypair_update_lock);
 	INIT_WORK(&peer->transmit_handshake_work, wg_packet_handshake_send_worker);
 	INIT_WORK(&peer->transmit_packet_work, wg_packet_tx_worker);
+	INIT_WORK(&peer->learn_ip_work, wg_allowedips_learn_worker);
 	wg_prev_queue_init(&peer->tx_queue);
 	wg_prev_queue_init(&peer->rx_queue);
 	rwlock_init(&peer->endpoint_lock);
@@ -58,6 +61,8 @@ struct wg_peer *wg_peer_create(struct wg_device *wg,
 	napi_enable(&peer->napi);
 	list_add_tail(&peer->peer_list, &wg->peer_list);
 	INIT_LIST_HEAD(&peer->allowedips_list);
+	INIT_LIST_HEAD(&peer->learnableips_list);
+	wg_allowedips_init(&peer->learnable_ips);
 	wg_pubkey_hashtable_add(wg->peer_hashtable, peer);
 	++wg->num_peers;
 	pr_debug("%s: Peer %llu created\n", wg->dev->name, peer->internal_id);
@@ -84,6 +89,7 @@ static void peer_make_dead(struct wg_peer *peer)
 	wg_allowedips_remove_by_peer(&peer->device->peer_allowedips, peer,
 				     &peer->device->device_update_lock);
 	wg_pubkey_hashtable_remove(peer->device->peer_hashtable, peer);
+	wg_allowedips_free(&peer->learnable_ips, &peer->device->device_update_lock);
 
 	/* Mark as dead, so that we don't allow jumping contexts after. */
 	WRITE_ONCE(peer->is_dead, true);
@@ -160,8 +166,10 @@ void wg_peer_remove(struct wg_peer *peer)
 	lockdep_assert_held(&peer->device->device_update_lock);
 
 	peer_make_dead(peer);
+	mutex_unlock(&peer->device->device_update_lock);
 	synchronize_net();
 	peer_remove_after_dead(peer);
+	mutex_lock(&peer->device->device_update_lock);
 }
 
 void wg_peer_remove_all(struct wg_device *wg)
@@ -178,9 +186,11 @@ void wg_peer_remove_all(struct wg_device *wg)
 		peer_make_dead(peer);
 		list_add_tail(&peer->peer_list, &dead_peers);
 	}
+	mutex_unlock(&wg->device_update_lock);
 	synchronize_net();
 	list_for_each_entry_safe(peer, temp, &dead_peers, peer_list)
 		peer_remove_after_dead(peer);
+	mutex_lock(&wg->device_update_lock);
 }
 
 static void rcu_release(struct rcu_head *rcu)

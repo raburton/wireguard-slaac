@@ -143,7 +143,7 @@ static int kernel_set_device(struct wgdevice *dev)
 {
 	int ret = 0;
 	struct wgpeer *peer = NULL;
-	struct wgallowedip *allowedip = NULL;
+	struct wgallowedip *allowedip = NULL, *learnableip = NULL;
 	struct nlattr *peers_nest, *peer_nest, *allowedips_nest, *allowedip_nest;
 	struct nlmsghdr *nlh;
 	struct mnlg_socket *nlg;
@@ -184,9 +184,11 @@ again:
 			goto toobig_peers;
 		if (peer->flags & WGPEER_REMOVE_ME)
 			flags |= WGPEER_F_REMOVE_ME;
-		if (!allowedip) {
+		if (!allowedip && !learnableip) {
 			if (peer->flags & WGPEER_REPLACE_ALLOWEDIPS)
 				flags |= WGPEER_F_REPLACE_ALLOWEDIPS;
+			if (peer->flags & WGPEER_REPLACE_LEARNABLEIPS)
+				flags |= WGPEER_F_REPLACE_LEARNABLEIPS;
 			if (peer->flags & WGPEER_HAS_PRESHARED_KEY) {
 				if (!mnl_attr_put_check(nlh, SOCKET_BUFFER_SIZE, WGPEER_A_PRESHARED_KEY, sizeof(peer->preshared_key), peer->preshared_key))
 					goto toobig_peers;
@@ -207,7 +209,7 @@ again:
 			if (!mnl_attr_put_u32_check(nlh, SOCKET_BUFFER_SIZE, WGPEER_A_FLAGS, flags))
 				goto toobig_peers;
 		}
-		if (peer->first_allowedip) {
+		if (peer->first_allowedip && !learnableip) {
 			if (!allowedip)
 				allowedip = peer->first_allowedip;
 			allowedips_nest = mnl_attr_nest_start_check(nlh, SOCKET_BUFFER_SIZE, WGPEER_A_ALLOWEDIPS);
@@ -229,6 +231,35 @@ again:
 				if (!mnl_attr_put_u8_check(nlh, SOCKET_BUFFER_SIZE, WGALLOWEDIP_A_CIDR_MASK, allowedip->cidr))
 					goto toobig_allowedips;
 				if (allowedip->flags && !mnl_attr_put_u32_check(nlh, SOCKET_BUFFER_SIZE, WGALLOWEDIP_A_FLAGS, allowedip->flags))
+					goto toobig_allowedips;
+				mnl_attr_nest_end(nlh, allowedip_nest);
+				allowedip_nest = NULL;
+			}
+			mnl_attr_nest_end(nlh, allowedips_nest);
+			allowedips_nest = NULL;
+		}
+		if (peer->first_learnableip && !allowedip) {
+			if (!learnableip)
+				learnableip = peer->first_learnableip;
+			allowedips_nest = mnl_attr_nest_start_check(nlh, SOCKET_BUFFER_SIZE, WGPEER_A_LEARNABLEIPS);
+			if (!allowedips_nest)
+				goto toobig_allowedips;
+			for (; learnableip; learnableip = learnableip->next_allowedip) {
+				allowedip_nest = mnl_attr_nest_start_check(nlh, SOCKET_BUFFER_SIZE, 0);
+				if (!allowedip_nest)
+					goto toobig_allowedips;
+				if (!mnl_attr_put_u16_check(nlh, SOCKET_BUFFER_SIZE, WGALLOWEDIP_A_FAMILY, learnableip->family))
+					goto toobig_allowedips;
+				if (learnableip->family == AF_INET) {
+					if (!mnl_attr_put_check(nlh, SOCKET_BUFFER_SIZE, WGALLOWEDIP_A_IPADDR, sizeof(learnableip->ip4), &learnableip->ip4))
+						goto toobig_allowedips;
+				} else if (learnableip->family == AF_INET6) {
+					if (!mnl_attr_put_check(nlh, SOCKET_BUFFER_SIZE, WGALLOWEDIP_A_IPADDR, sizeof(learnableip->ip6), &learnableip->ip6))
+						goto toobig_allowedips;
+				}
+				if (!mnl_attr_put_u8_check(nlh, SOCKET_BUFFER_SIZE, WGALLOWEDIP_A_CIDR_MASK, learnableip->cidr))
+					goto toobig_allowedips;
+				if (learnableip->flags && !mnl_attr_put_u32_check(nlh, SOCKET_BUFFER_SIZE, WGALLOWEDIP_A_FLAGS, learnableip->flags))
 					goto toobig_allowedips;
 				mnl_attr_nest_end(nlh, allowedip_nest);
 				allowedip_nest = NULL;
@@ -325,6 +356,28 @@ static int parse_allowedips(const struct nlattr *attr, void *data)
 	return MNL_CB_OK;
 }
 
+static int parse_learnableips(const struct nlattr *attr, void *data)
+{
+	struct wgpeer *peer = data;
+	struct wgallowedip *new_allowedip = calloc(1, sizeof(*new_allowedip));
+	int ret;
+
+	if (!new_allowedip) {
+		perror("calloc");
+		return MNL_CB_ERROR;
+	}
+	if (!peer->first_learnableip)
+		peer->first_learnableip = peer->last_learnableip = new_allowedip;
+	else {
+		peer->last_learnableip->next_allowedip = new_allowedip;
+		peer->last_learnableip = new_allowedip;
+	}
+	ret = mnl_attr_parse_nested(attr, parse_allowedip, new_allowedip);
+	if (!ret)
+		return ret;
+	return MNL_CB_OK;
+}
+
 static int parse_peer(const struct nlattr *attr, void *data)
 {
 	struct wgpeer *peer = data;
@@ -375,6 +428,8 @@ static int parse_peer(const struct nlattr *attr, void *data)
 		break;
 	case WGPEER_A_ALLOWEDIPS:
 		return mnl_attr_parse_nested(attr, parse_allowedips, peer);
+	case WGPEER_A_LEARNABLEIPS:
+		return mnl_attr_parse_nested(attr, parse_learnableips, peer);
 	}
 
 	return MNL_CB_OK;
@@ -469,6 +524,14 @@ static void coalesce_peers(struct wgdevice *device)
 			peer->last_allowedip->next_allowedip = peer->next_peer->first_allowedip;
 			peer->last_allowedip = peer->next_peer->last_allowedip;
 		}
+		if (!peer->first_learnableip) {
+			peer->first_learnableip = peer->next_peer->first_learnableip;
+			peer->last_learnableip = peer->next_peer->last_learnableip;
+		} else if (peer->next_peer->first_learnableip) {
+			peer->last_learnableip->next_allowedip = peer->next_peer->first_learnableip;
+			peer->last_learnableip = peer->next_peer->last_learnableip;
+		}
+
 		old_next_peer = peer->next_peer;
 		peer->next_peer = old_next_peer->next_peer;
 		free(old_next_peer);

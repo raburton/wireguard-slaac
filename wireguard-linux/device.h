@@ -44,6 +44,7 @@ struct wg_device {
 	struct net __rcu *creating_net;
 	struct noise_static_identity static_identity;
 	struct workqueue_struct *packet_crypt_wq,*handshake_receive_wq, *handshake_send_wq;
+	struct delayed_work allowedips_gc_work;
 	struct cookie_checker cookie_checker;
 	struct pubkey_hashtable *peer_hashtable;
 	struct index_hashtable *index_hashtable;

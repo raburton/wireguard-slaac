@@ -44,6 +44,10 @@ struct wg_peer {
 	struct endpoint endpoint;
 	struct dst_cache endpoint_cache;
 	rwlock_t endpoint_lock;
+	struct work_struct learn_ip_work;
+	struct in6_addr learned_ip_queue[8];
+	unsigned int learned_ip_queue_head, learned_ip_queue_tail;
+	spinlock_t learned_ip_queue_lock;
 	struct noise_handshake handshake;
 	atomic64_t last_sent_handshake;
 	struct work_struct transmit_handshake_work, clear_peer_work, transmit_packet_work;
@@ -62,8 +66,11 @@ struct wg_peer {
 	struct rcu_head rcu;
 	struct list_head peer_list;
 	struct list_head allowedips_list;
+	struct list_head learnableips_list;
 	struct napi_struct napi;
 	u64 internal_id;
+	struct allowedips learnable_ips;
+	atomic_t learned_ip_count;
 };
 
 struct wg_peer *wg_peer_create(struct wg_device *wg,
