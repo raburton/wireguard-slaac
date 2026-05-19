@@ -1,4 +1,6 @@
-KDIR := /lib/modules/$(shell uname -r)/build
+# If DKMS passes KERNELRELEASE, use it. Otherwise, fall back to the running kernel.
+KVER := $(or $(KERNELRELEASE),$(shell uname -r))
+KDIR := /lib/modules/$(KVER)/build
 PWD := $(shell pwd)
 
 all: kernel tools
