@@ -10,7 +10,7 @@ enum { MAX_ALLOWEDIPS_DEPTH = 129 };
 
 static struct kmem_cache *node_cache;
 
-static void swap_endian(u8 *dst, const u8 *src, u8 bits)
+void swap_endian(u8 *dst, const u8 *src, u8 bits)
 {
 	if (bits == 32) {
 		*(u32 *)dst = be32_to_cpu(*(const __be32 *)src);
@@ -178,8 +178,8 @@ static inline void choose_and_connect_node(struct allowedips_node *parent, struc
 	connect_node(&parent->bit[bit], bit, node);
 }
 
-static int add(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
-	       u8 cidr, struct wg_peer *peer, struct mutex *lock)
+int add(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
+	       u8 cidr, struct wg_peer *peer, struct list_head *peer_list, bool learned, struct mutex *lock)
 {
 	struct allowedips_node *node, *parent, *down, *newnode;
 
@@ -191,14 +191,14 @@ static int add(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
 		if (unlikely(!node))
 			return -ENOMEM;
 		RCU_INIT_POINTER(node->peer, peer);
-		list_add_tail(&node->peer_list, &peer->allowedips_list);
+		list_add_tail(&node->peer_list, peer_list);
 		copy_and_assign_cidr(node, key, cidr, bits);
 		connect_node(trie, 2, node);
 		return 0;
 	}
 	if (node_placement(*trie, key, cidr, bits, &node, lock)) {
 		rcu_assign_pointer(node->peer, peer);
-		list_move_tail(&node->peer_list, &peer->allowedips_list);
+		list_move_tail(&node->peer_list, peer_list);
 		return 0;
 	}
 
@@ -206,7 +206,7 @@ static int add(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
 	if (unlikely(!newnode))
 		return -ENOMEM;
 	RCU_INIT_POINTER(newnode->peer, peer);
-	list_add_tail(&newnode->peer_list, &peer->allowedips_list);
+	list_add_tail(&newnode->peer_list, peer_list);
 	copy_and_assign_cidr(newnode, key, cidr, bits);
 
 	if (!node) {
@@ -249,7 +249,9 @@ static int add(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
 	return 0;
 }
 
-static void remove_node(struct allowedips_node *node, struct mutex *lock)
+static void __wg_allowedips_remove_node(struct allowedips *table,
+					struct allowedips_node *node,
+					struct mutex *lock)
 {
 	struct allowedips_node *child, **parent_bit, *parent;
 	bool free_parent;
@@ -280,8 +282,9 @@ static void remove_node(struct allowedips_node *node, struct mutex *lock)
 	call_rcu(&parent->rcu, node_free_rcu);
 }
 
-static int remove(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
-		  u8 cidr, struct wg_peer *peer, struct mutex *lock)
+static int remove(struct allowedips *table, struct allowedips_node __rcu **trie,
+			u8 bits, const u8 *key, u8 cidr, struct wg_peer *peer,
+			struct mutex *lock)
 {
 	struct allowedips_node *node;
 
@@ -291,7 +294,7 @@ static int remove(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
 	    peer != rcu_access_pointer(node->peer))
 		return 0;
 
-	remove_node(node, lock);
+	__wg_allowedips_remove_node(table, node, lock);
 	return 0;
 }
 
@@ -332,7 +335,7 @@ int wg_allowedips_insert_v4(struct allowedips *table, const struct in_addr *ip,
 
 	++table->seq;
 	swap_endian(key, (const u8 *)ip, 32);
-	return add(&table->root4, 32, key, cidr, peer, lock);
+	return add(&table->root4, 32, key, cidr, peer, &peer->allowedips_list, false, lock);
 }
 
 int wg_allowedips_insert_v6(struct allowedips *table, const struct in6_addr *ip,
@@ -343,7 +346,7 @@ int wg_allowedips_insert_v6(struct allowedips *table, const struct in6_addr *ip,
 
 	++table->seq;
 	swap_endian(key, (const u8 *)ip, 128);
-	return add(&table->root6, 128, key, cidr, peer, lock);
+	return add(&table->root6, 128, key, cidr, peer, &peer->allowedips_list, false, lock);
 }
 
 int wg_allowedips_remove_v4(struct allowedips *table, const struct in_addr *ip,
@@ -354,7 +357,7 @@ int wg_allowedips_remove_v4(struct allowedips *table, const struct in_addr *ip,
 
 	++table->seq;
 	swap_endian(key, (const u8 *)ip, 32);
-	return remove(&table->root4, 32, key, cidr, peer, lock);
+	return remove(table, &table->root4, 32, key, cidr, peer, lock);
 }
 
 int wg_allowedips_remove_v6(struct allowedips *table, const struct in6_addr *ip,
@@ -365,7 +368,7 @@ int wg_allowedips_remove_v6(struct allowedips *table, const struct in6_addr *ip,
 
 	++table->seq;
 	swap_endian(key, (const u8 *)ip, 128);
-	return remove(&table->root6, 128, key, cidr, peer, lock);
+	return remove(table, &table->root6, 128, key, cidr, peer, lock);
 }
 
 void wg_allowedips_remove_by_peer(struct allowedips *table,
@@ -377,7 +380,7 @@ void wg_allowedips_remove_by_peer(struct allowedips *table,
 		return;
 	++table->seq;
 	list_for_each_entry_safe(node, tmp, &peer->allowedips_list, peer_list)
-		remove_node(node, lock);
+		__wg_allowedips_remove_node(table, node, lock);
 }
 
 int wg_allowedips_read_node(struct allowedips_node *node, u8 ip[16], u8 *cidr)
@@ -413,6 +416,27 @@ struct wg_peer *wg_allowedips_lookup_src(struct allowedips *table,
 		return lookup(table->root6, 128, &ipv6_hdr(skb)->saddr);
 	return NULL;
 }
+
+/* Returns true if the given IPv6 address is contained in the table. */
+bool wg_allowedips_contains_v6(struct allowedips *table, const struct in6_addr *addr)
+{
+	u8 ip[16] __aligned(__alignof(u64));
+	struct allowedips_node *node;
+	bool found = false;
+
+	swap_endian(ip, (const u8 *)addr, 128);
+
+	rcu_read_lock_bh();
+	if (rcu_access_pointer(table->root6)) {
+		node = find_node(rcu_dereference_bh(table->root6), 128, ip);
+		if (node && rcu_access_pointer(node->peer))
+			found = true;
+	}
+	rcu_read_unlock_bh();
+
+	return found;
+}
+
 
 int __init wg_allowedips_slab_init(void)
 {

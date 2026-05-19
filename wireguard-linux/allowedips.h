@@ -34,6 +34,8 @@ struct allowedips {
 
 void wg_allowedips_init(struct allowedips *table);
 void wg_allowedips_free(struct allowedips *table, struct mutex *mutex);
+/* Check whether the given IPv6 address is covered by any prefix in the table. */
+bool wg_allowedips_contains_v6(struct allowedips *table, const struct in6_addr *addr);
 int wg_allowedips_insert_v4(struct allowedips *table, const struct in_addr *ip,
 			    u8 cidr, struct wg_peer *peer, struct mutex *lock);
 int wg_allowedips_insert_v6(struct allowedips *table, const struct in6_addr *ip,
@@ -45,6 +47,10 @@ int wg_allowedips_remove_v6(struct allowedips *table, const struct in6_addr *ip,
 void wg_allowedips_remove_by_peer(struct allowedips *table,
 				  struct wg_peer *peer, struct mutex *lock);
 /* The ip input pointer should be __aligned(__alignof(u64))) */
+void swap_endian(u8 *dst, const u8 *src, u8 bits);
+int add(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
+	u8 cidr, struct wg_peer *peer, struct list_head *peer_list,
+	bool learned, struct mutex *lock);
 int wg_allowedips_read_node(struct allowedips_node *node, u8 ip[16], u8 *cidr);
 
 /* These return a strong reference to a peer: */

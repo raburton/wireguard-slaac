@@ -202,7 +202,7 @@ static char *bytes(uint64_t b)
 static const char *COMMAND_NAME;
 static void show_usage(void)
 {
-	fprintf(stderr, "Usage: %s %s { <interface> | all | interfaces } [public-key | private-key | listen-port | fwmark | peers | preshared-keys | endpoints | allowed-ips | latest-handshakes | transfer | persistent-keepalive | dump]\n", PROG_NAME, COMMAND_NAME);
+	fprintf(stderr, "Usage: %s %s { <interface> | all | interfaces } [public-key | private-key | listen-port | fwmark | peers | preshared-keys | endpoints | allowed-ips | learnable-ips | learned-ips | latest-handshakes | transfer | persistent-keepalive | dump]\n", PROG_NAME, COMMAND_NAME);
 }
 
 static void pretty_print(struct wgdevice *device)
@@ -233,6 +233,18 @@ static void pretty_print(struct wgdevice *device)
 		terminal_printf("  " TERMINAL_BOLD "allowed ips" TERMINAL_RESET ": ");
 		if (peer->first_allowedip) {
 			for_each_wgallowedip(peer, allowedip)
+				terminal_printf("%s" TERMINAL_FG_CYAN "/" TERMINAL_RESET "%u%s", ip(allowedip), allowedip->cidr, allowedip->next_allowedip ? ", " : "\n");
+		} else
+			terminal_printf("(none)\n");
+		terminal_printf("  " TERMINAL_BOLD "learnable ips" TERMINAL_RESET ": ");
+		if (peer->first_learnableip) {
+			for (allowedip = peer->first_learnableip; allowedip; allowedip = allowedip->next_allowedip)
+				terminal_printf("%s" TERMINAL_FG_CYAN "/" TERMINAL_RESET "%u%s", ip(allowedip), allowedip->cidr, allowedip->next_allowedip ? ", " : "\n");
+		} else
+			terminal_printf("(none)\n");
+		terminal_printf("  " TERMINAL_BOLD "learned ips" TERMINAL_RESET ": ");
+		if (peer->first_learnedip) {
+			for (allowedip = peer->first_learnedip; allowedip; allowedip = allowedip->next_allowedip)
 				terminal_printf("%s" TERMINAL_FG_CYAN "/" TERMINAL_RESET "%u%s", ip(allowedip), allowedip->cidr, allowedip->next_allowedip ? ", " : "\n");
 		} else
 			terminal_printf("(none)\n");
@@ -366,9 +378,31 @@ static bool ugly_print(struct wgdevice *device, const char *param, bool with_int
 				printf("%s\t", device->name);
 			printf("%s\n", key(peer->public_key));
 		}
-	} else if (!strcmp(param, "dump"))
+	} else if (!strcmp(param, "dump")) {
 		dump_print(device, with_interface);
-	else {
+	} else if (!strcmp(param, "learned-ips")) {
+		for_each_wgpeer(device, peer) {
+			if (with_interface)
+				printf("%s\t", device->name);
+			printf("%s\t", key(peer->public_key));
+			if (peer->first_learnedip) {
+				for (allowedip = peer->first_learnedip; allowedip; allowedip = allowedip->next_allowedip)
+					printf("%s/%u%c", ip(allowedip), allowedip->cidr, allowedip->next_allowedip ? ' ' : '\n');
+			} else
+				printf("(none)\n");
+		}
+	} else if (!strcmp(param, "learnable-ips")) {
+		for_each_wgpeer(device, peer) {
+			if (with_interface)
+				printf("%s\t", device->name);
+			printf("%s\t", key(peer->public_key));
+			if (peer->first_learnableip) {
+				for (allowedip = peer->first_learnableip; allowedip; allowedip = allowedip->next_allowedip)
+					printf("%s/%u%c", ip(allowedip), allowedip->cidr, allowedip->next_allowedip ? ' ' : '\n');
+			} else
+				printf("(none)\n");
+		}
+	} else {
 		fprintf(stderr, "Invalid parameter: `%s'\n", param);
 		show_usage();
 		return false;

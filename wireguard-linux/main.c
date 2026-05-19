@@ -9,6 +9,7 @@
 #include "queueing.h"
 #include "ratelimiter.h"
 #include "netlink.h"
+#include "learnedips.h"
 
 #include <uapi/linux/wireguard.h>
 
@@ -24,6 +25,10 @@ static int __init wg_mod_init(void)
 	ret = wg_allowedips_slab_init();
 	if (ret < 0)
 		goto err_allowedips;
+
+	ret = wg_learnedips_slab_init();
+	if (ret < 0)
+		goto err_learnedips;
 
 #ifdef DEBUG
 	ret = -ENOTRECOVERABLE;
@@ -55,6 +60,8 @@ err_netlink:
 err_device:
 	wg_peer_uninit();
 err_peer:
+	wg_learnedips_slab_uninit();
+err_learnedips:
 	wg_allowedips_slab_uninit();
 err_allowedips:
 	return ret;
@@ -65,6 +72,7 @@ static void __exit wg_mod_exit(void)
 	wg_genetlink_uninit();
 	wg_device_uninit();
 	wg_peer_uninit();
+	wg_learnedips_slab_uninit();
 	wg_allowedips_slab_uninit();
 }
 

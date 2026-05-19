@@ -69,6 +69,8 @@ struct dump_ctx {
 	struct wg_peer *next_peer;
 	u64 allowedips_seq;
 	struct allowedips_node *next_allowedip;
+	u64 learnableips_seq;
+	struct allowedips_node *next_learnableip;
 };
 
 #define DUMP_CTX(cb) ((struct dump_ctx *)(cb)->args)
@@ -76,9 +78,9 @@ struct dump_ctx {
 static int
 get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
 {
-
-	struct nlattr *allowedips_nest, *peer_nest = nla_nest_start(skb, 0);
+	struct nlattr *allowedips_nest, *learnableips_nest, *peer_nest = nla_nest_start(skb, 0);
 	struct allowedips_node *allowedips_node = ctx->next_allowedip;
+	struct allowedips_node *learnableips_node = ctx->next_learnableip;
 	bool fail;
 
 	if (!peer_nest)
@@ -131,36 +133,93 @@ get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
 		allowedips_node =
 			list_first_entry_or_null(&peer->allowedips_list,
 					struct allowedips_node, peer_list);
+		learnableips_node =
+			list_first_entry_or_null(&peer->learnable_allowedips_list,
+					struct allowedips_node, peer_list);
 	}
-	if (!allowedips_node)
+	if (!allowedips_node && !learnableips_node)
 		goto no_allowedips;
 	if (!ctx->allowedips_seq)
 		ctx->allowedips_seq = ctx->wg->peer_allowedips.seq;
 	else if (ctx->allowedips_seq != ctx->wg->peer_allowedips.seq)
-		goto no_allowedips;
+		allowedips_node = NULL;
 
-	allowedips_nest = nla_nest_start(skb, WGPEER_A_ALLOWEDIPS);
-	if (!allowedips_nest)
-		goto err;
+	if (allowedips_node) {
+		allowedips_nest = nla_nest_start(skb, WGPEER_A_ALLOWEDIPS);
+		if (!allowedips_nest)
+			goto err;
 
-	list_for_each_entry_from(allowedips_node, &peer->allowedips_list,
-				 peer_list) {
-		u8 cidr, ip[16] __aligned(__alignof(u64));
-		int family;
+		list_for_each_entry_from(allowedips_node, &peer->allowedips_list,
+					 peer_list) {
+			u8 cidr, ip[16] __aligned(__alignof(u64));
+			int family;
 
-		family = wg_allowedips_read_node(allowedips_node, ip, &cidr);
-		if (get_allowedips(skb, ip, cidr, family)) {
-			nla_nest_end(skb, allowedips_nest);
-			nla_nest_end(skb, peer_nest);
-			ctx->next_allowedip = allowedips_node;
-			return -EMSGSIZE;
+			family = wg_allowedips_read_node(allowedips_node, ip, &cidr);
+			if (get_allowedips(skb, ip, cidr, family)) {
+				nla_nest_end(skb, allowedips_nest);
+				nla_nest_end(skb, peer_nest);
+				ctx->next_allowedip = allowedips_node;
+				return -EMSGSIZE;
+			}
 		}
+		nla_nest_end(skb, allowedips_nest);
+		ctx->next_allowedip = NULL;
+		ctx->allowedips_seq = 0;
 	}
-	nla_nest_end(skb, allowedips_nest);
+
+	if (!ctx->learnableips_seq)
+		ctx->learnableips_seq = peer->learnable_ips.seq;
+	else if (ctx->learnableips_seq != peer->learnable_ips.seq)
+		learnableips_node = NULL;
+
+	if (learnableips_node) {
+		learnableips_nest = nla_nest_start(skb, WGPEER_A_LEARNABLEIPS);
+		if (!learnableips_nest)
+			goto err;
+
+		list_for_each_entry_from(learnableips_node, &peer->learnable_allowedips_list,
+					 peer_list) {
+			u8 cidr, ip[16] __aligned(__alignof(u64));
+			int family;
+
+			family = wg_allowedips_read_node(learnableips_node, ip, &cidr);
+			if (get_allowedips(skb, ip, cidr, family)) {
+				nla_nest_end(skb, learnableips_nest);
+				nla_nest_end(skb, peer_nest);
+				ctx->next_learnableip = learnableips_node;
+				return -EMSGSIZE;
+			}
+		}
+		nla_nest_end(skb, learnableips_nest);
+		ctx->next_learnableip = NULL;
+		ctx->learnableips_seq = 0;
+	}
+
+	/* Learned IPv6 /128 addresses: iterate the peer's per-peer learned_list
+	 * while holding the learned_table write lock. This avoids scanning the
+	 * entire device table for each peer and preserves a simple locking order
+	 * (device_update_lock then tbl->lock).
+	 */
+	{
+		struct wg_learned_table *tbl = &ctx->wg->learned_table;
+		struct wg_learned_entry *lentry;
+		learnableips_nest = nla_nest_start(skb, WGPEER_A_LEARNEDIPS);
+		if (!learnableips_nest)
+			goto err;
+		spin_lock_bh(&tbl->lock);
+		list_for_each_entry(lentry, &peer->learned_list, peer_list) {
+			if (get_allowedips(skb, (const u8 *)&lentry->addr, 128, AF_INET6)) {
+				nla_nest_end(skb, learnableips_nest);
+				spin_unlock_bh(&tbl->lock);
+				goto err;
+			}
+		}
+		spin_unlock_bh(&tbl->lock);
+		nla_nest_end(skb, learnableips_nest);
+	}
+
 no_allowedips:
 	nla_nest_end(skb, peer_nest);
-	ctx->next_allowedip = NULL;
-	ctx->allowedips_seq = 0;
 	return 0;
 err:
 	nla_nest_cancel(skb, peer_nest);
@@ -297,7 +356,8 @@ static int set_port(struct wg_device *wg, u16 port)
 	return wg_socket_init(wg, port);
 }
 
-static int set_allowedip(struct wg_peer *peer, struct nlattr **attrs)
+static int set_allowedip(struct wg_peer *peer, struct nlattr **attrs,
+			 struct allowedips *table, struct list_head *peer_list)
 {
 	int ret = -EINVAL;
 	u32 flags = 0;
@@ -313,25 +373,27 @@ static int set_allowedip(struct wg_peer *peer, struct nlattr **attrs)
 		flags = nla_get_u32(attrs[WGALLOWEDIP_A_FLAGS]);
 
 	if (family == AF_INET && cidr <= 32 &&
-	    nla_len(attrs[WGALLOWEDIP_A_IPADDR]) == sizeof(struct in_addr)) {
+		nla_len(attrs[WGALLOWEDIP_A_IPADDR]) == sizeof(struct in_addr)) {
 		if (flags & WGALLOWEDIP_F_REMOVE_ME)
-			ret = wg_allowedips_remove_v4(&peer->device->peer_allowedips,
-						      nla_data(attrs[WGALLOWEDIP_A_IPADDR]), cidr,
-						      peer, &peer->device->device_update_lock);
-		else
-			ret = wg_allowedips_insert_v4(&peer->device->peer_allowedips,
-						      nla_data(attrs[WGALLOWEDIP_A_IPADDR]), cidr,
-						      peer, &peer->device->device_update_lock);
+			ret = wg_allowedips_remove_v4(table,
+										  nla_data(attrs[WGALLOWEDIP_A_IPADDR]), cidr,
+										  peer, &peer->device->device_update_lock);
+		else {
+			u8 key[4] __aligned(__alignof(u32));
+			swap_endian(key, nla_data(attrs[WGALLOWEDIP_A_IPADDR]), 32);
+			ret = add(&table->root4, 32, key, cidr, peer, peer_list, false, &peer->device->device_update_lock);
+		}
 	} else if (family == AF_INET6 && cidr <= 128 &&
 		   nla_len(attrs[WGALLOWEDIP_A_IPADDR]) == sizeof(struct in6_addr)) {
 		if (flags & WGALLOWEDIP_F_REMOVE_ME)
-			ret = wg_allowedips_remove_v6(&peer->device->peer_allowedips,
-						      nla_data(attrs[WGALLOWEDIP_A_IPADDR]), cidr,
-						      peer, &peer->device->device_update_lock);
-		else
-			ret = wg_allowedips_insert_v6(&peer->device->peer_allowedips,
-						      nla_data(attrs[WGALLOWEDIP_A_IPADDR]), cidr,
-						      peer, &peer->device->device_update_lock);
+			ret = wg_allowedips_remove_v6(table,
+										  nla_data(attrs[WGALLOWEDIP_A_IPADDR]), cidr,
+										  peer, &peer->device->device_update_lock);
+		else {
+			u8 key[16] __aligned(__alignof(u64));
+			swap_endian(key, nla_data(attrs[WGALLOWEDIP_A_IPADDR]), 128);
+			ret = add(&table->root6, 128, key, cidr, peer, peer_list, false, &peer->device->device_update_lock);
+		}
 	}
 
 	return ret;
@@ -371,7 +433,8 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
 			goto out;
 
 		/* The peer is new, so there aren't allowed IPs to remove. */
-		flags &= ~WGPEER_F_REPLACE_ALLOWEDIPS;
+		flags &= ~(WGPEER_F_REPLACE_ALLOWEDIPS |
+			   WGPEER_F_REPLACE_LEARNABLEIPS);
 
 		down_read(&wg->static_identity.lock);
 		if (wg->static_identity.has_identity &&
@@ -431,6 +494,10 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
 		wg_allowedips_remove_by_peer(&wg->peer_allowedips, peer,
 					     &wg->device_update_lock);
 
+	if (flags & WGPEER_F_REPLACE_LEARNABLEIPS)
+		wg_allowedips_remove_by_peer(&peer->learnable_ips, peer,
+					     &wg->device_update_lock);
+
 	if (attrs[WGPEER_A_ALLOWEDIPS]) {
 		struct nlattr *attr, *allowedip[WGALLOWEDIP_A_MAX + 1];
 		int rem;
@@ -440,7 +507,23 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
 					       attr, NULL, NULL);
 			if (ret < 0)
 				goto out;
-			ret = set_allowedip(peer, allowedip);
+			ret = set_allowedip(peer, allowedip, &wg->peer_allowedips, &peer->allowedips_list);
+			if (ret < 0)
+				goto out;
+		}
+	}
+
+	if (attrs[WGPEER_A_LEARNABLEIPS]) {
+		struct nlattr *attr, *learnableip[WGALLOWEDIP_A_MAX + 1];
+		int rem;
+
+		nla_for_each_nested(attr, attrs[WGPEER_A_LEARNABLEIPS], rem) {
+			ret = nla_parse_nested(learnableip, WGALLOWEDIP_A_MAX,
+					       attr, NULL, NULL);
+			if (ret < 0)
+				goto out;
+			/* Insert into the peer-specific learnable_ips table with its own list head */
+			ret = set_allowedip(peer, learnableip, &peer->learnable_ips, &peer->learnable_allowedips_list);
 			if (ret < 0)
 				goto out;
 		}

@@ -11,6 +11,7 @@ wireguard-y += receive.o
 wireguard-y += socket.o
 wireguard-y += peerlookup.o
 wireguard-y += allowedips.o
+wireguard-y += learnedips.o
 wireguard-y += ratelimiter.o
 wireguard-y += cookie.o
 wireguard-y += netlink.o generated/netlink.o

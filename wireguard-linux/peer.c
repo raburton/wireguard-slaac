@@ -9,6 +9,7 @@
 #include "timers.h"
 #include "peerlookup.h"
 #include "noise.h"
+#include "learnedips.h"
 
 #include <linux/kref.h>
 #include <linux/lockdep.h>
@@ -58,6 +59,9 @@ struct wg_peer *wg_peer_create(struct wg_device *wg,
 	napi_enable(&peer->napi);
 	list_add_tail(&peer->peer_list, &wg->peer_list);
 	INIT_LIST_HEAD(&peer->allowedips_list);
+	INIT_LIST_HEAD(&peer->learned_list);
+	INIT_LIST_HEAD(&peer->learnable_allowedips_list);
+	wg_allowedips_init(&peer->learnable_ips);
 	wg_pubkey_hashtable_add(wg->peer_hashtable, peer);
 	++wg->num_peers;
 	pr_debug("%s: Peer %llu created\n", wg->dev->name, peer->internal_id);
@@ -123,6 +127,11 @@ static void peer_remove_after_dead(struct wg_peer *peer)
 	 */
 	netif_napi_del(&peer->napi);
 
+	/* Remove all learned IPv6 addresses for this peer.  NAPI is disabled
+	 * above so the receive path can no longer add new entries.
+	 */
+	wg_learnedips_remove_by_peer(peer->device, peer);
+
 	/* Ensure any workstructs we own (like transmit_handshake_work or
 	 * clear_peer_work) no longer are in use.
 	 */
@@ -159,8 +168,16 @@ void wg_peer_remove(struct wg_peer *peer)
 		return;
 	lockdep_assert_held(&peer->device->device_update_lock);
 
+	/* Mark peer dead while holding device_update_lock, then release the
+	 * mutex before waiting for in-flight references to drain. This avoids
+	 * sleeping while holding the device update mutex which can invert
+	 * locking order with other contexts that take the learned-table
+	 * spinlock and then the device mutex.
+	 */
 	peer_make_dead(peer);
+	mutex_unlock(&peer->device->device_update_lock);
 	synchronize_net();
+	mutex_lock(&peer->device->device_update_lock);
 	peer_remove_after_dead(peer);
 }
 

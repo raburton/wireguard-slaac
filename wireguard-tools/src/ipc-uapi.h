@@ -91,6 +91,19 @@ static int userspace_set_device(struct wgdevice *dev)
 				continue;
 			fprintf(f, "allowed_ip=%s%s/%d\n", (allowedip->flags & WGALLOWEDIP_REMOVE_ME) ? "-" : "", ip, allowedip->cidr);
 		}
+		if (peer->first_learnedip) {
+			for (struct wgallowedip *learned = peer->first_learnedip; learned; learned = learned->next_allowedip) {
+				if (learned->family == AF_INET) {
+					if (!inet_ntop(AF_INET, &learned->ip4, ip, INET6_ADDRSTRLEN))
+						continue;
+				} else if (learned->family == AF_INET6) {
+					if (!inet_ntop(AF_INET6, &learned->ip6, ip, INET6_ADDRSTRLEN))
+						continue;
+				} else
+					continue;
+				fprintf(f, "learned_ip=%s/%d\n", ip, learned->cidr);
+			}
+		}
 	}
 	fprintf(f, "\n");
 	fflush(f);
@@ -244,6 +257,33 @@ static int userspace_get_device(struct wgdevice **out, const char *iface)
 		} else if (peer && !strcmp(key, "persistent_keepalive_interval")) {
 			peer->persistent_keepalive_interval = NUM(0xffffU);
 			peer->flags |= WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL;
+		} else if (peer && !strcmp(key, "learned_ip")) {
+			struct wgallowedip *new_allowedip;
+			char *end, *mask = value, *ip = strsep(&mask, "/");
+
+			if (!mask || !char_is_digit(mask[0]))
+				break;
+			new_allowedip = calloc(1, sizeof(*new_allowedip));
+			if (!new_allowedip) {
+				ret = -ENOMEM;
+				goto err;
+			}
+			if (peer->last_learnedip)
+				peer->last_learnedip->next_allowedip = new_allowedip;
+			else
+				peer->first_learnedip = new_allowedip;
+			peer->last_learnedip = new_allowedip;
+			new_allowedip->family = AF_UNSPEC;
+			if (strchr(ip, ':')) {
+				if (inet_pton(AF_INET6, ip, &new_allowedip->ip6) == 1)
+					new_allowedip->family = AF_INET6;
+			} else {
+				if (inet_pton(AF_INET, ip, &new_allowedip->ip4) == 1)
+					new_allowedip->family = AF_INET;
+			}
+			new_allowedip->cidr = strtoul(mask, &end, 10);
+			if (*end || new_allowedip->family == AF_UNSPEC || (new_allowedip->family == AF_INET6 && new_allowedip->cidr > 128) || (new_allowedip->family == AF_INET && new_allowedip->cidr > 32))
+				break;
 		} else if (peer && !strcmp(key, "allowed_ip")) {
 			struct wgallowedip *new_allowedip;
 			char *end, *mask = value, *ip = strsep(&mask, "/");

@@ -71,6 +71,21 @@ int showconf_main(int argc, const char *argv[])
 		}
 		if (peer->first_allowedip)
 			printf("\n");
+		if (peer->first_learnableip) {
+			printf("LearnableIPs = ");
+			for (allowedip = peer->first_learnableip; allowedip; allowedip = allowedip->next_allowedip) {
+				if (allowedip->family == AF_INET)
+					inet_ntop(AF_INET, &allowedip->ip4, ip, INET6_ADDRSTRLEN);
+				else if (allowedip->family == AF_INET6)
+					inet_ntop(AF_INET6, &allowedip->ip6, ip, INET6_ADDRSTRLEN);
+				else
+					continue;
+				printf("%s/%d", ip, allowedip->cidr);
+				if (allowedip->next_allowedip)
+					printf(", ");
+			}
+			printf("\n");
+		}
 
 		if (peer->endpoint.addr.sa_family == AF_INET || peer->endpoint.addr.sa_family == AF_INET6) {
 			char host[4096 + 1];

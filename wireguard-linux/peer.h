@@ -62,8 +62,12 @@ struct wg_peer {
 	struct rcu_head rcu;
 	struct list_head peer_list;
 	struct list_head allowedips_list;
+	struct list_head learned_list; /* per-peer list of wg_learned_entry */
+	int learned_count;             /* number of learned entries; protected by wg_device.learned_table.lock */
+	struct list_head learnable_allowedips_list;
 	struct napi_struct napi;
 	u64 internal_id;
+	struct allowedips learnable_ips;
 };
 
 struct wg_peer *wg_peer_create(struct wg_device *wg,

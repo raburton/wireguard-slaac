@@ -10,6 +10,7 @@
 #include "messages.h"
 #include "cookie.h"
 #include "socket.h"
+#include "learnedips.h"
 
 #include <linux/ip.h>
 #include <linux/ipv6.h>
@@ -405,8 +406,28 @@ static void wg_packet_consume_data_done(struct wg_peer *peer,
 					       skb);
 	wg_peer_put(routed_peer); /* We don't need the extra reference. */
 
-	if (unlikely(routed_peer != peer))
+	if (unlikely(routed_peer != peer)) {
+		/*
+		 * The packet's source IP is not covered by any static
+		 * AllowedIPs entry for this peer.  For authenticated IPv6
+		 * packets that have no static AllowedIPs match at all, try
+		 * the learned-address table.  If the address is already
+		 * associated with a *different* peer (anti-hijack), or with
+		 * this peer (refreshes last_used), wg_learnedips_learn()
+		 * returns accordingly.
+		 *
+		 * In this first stage any authenticated IPv6 source address
+		 * is learnable; userspace-configurable prefix restrictions
+		 * will be added in a later stage.
+		 */
+		if (skb->protocol == htons(ETH_P_IPV6) && !routed_peer &&
+		    wg_learnedips_learn(peer->device, peer,
+					&ipv6_hdr(skb)->saddr))
+			goto packet_accepted;
 		goto dishonest_packet_peer;
+	}
+
+packet_accepted:
 
 	napi_gro_receive(&peer->napi, skb);
 	update_rx_stats(peer, message_data_len(len_before_trim));

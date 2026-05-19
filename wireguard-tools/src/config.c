@@ -337,16 +337,16 @@ static bool validate_netmask(struct wgallowedip *allowedip)
 	return true;
 }
 
-static inline void parse_ip_prefix(struct wgpeer *peer, uint32_t *flags, char **mask)
+static inline void parse_ip_prefix(struct wgpeer *peer, uint32_t *flags, char **mask, uint32_t replace_flag)
 {
 	/* If the IP is prefixed with either '+' or '-' consider this an
-	 * incremental change. Disable WGPEER_REPLACE_ALLOWEDIPS. */
+	 * incremental change. Disable the provided replace_flag on the peer. */
 	switch ((*mask)[0]) {
 	case '-':
 		*flags |= WGALLOWEDIP_REMOVE_ME;
 		/* fall through */
 	case '+':
-		peer->flags &= ~WGPEER_REPLACE_ALLOWEDIPS;
+		peer->flags &= ~replace_flag;
 		++(*mask);
 	}
 }
@@ -368,10 +368,10 @@ static inline bool parse_allowedips(struct wgpeer *peer, struct wgallowedip **la
 	sep = mutable;
 	while ((mask = strsep(&sep, ","))) {
 		uint32_t flags = 0;
+		/* Support +/- prefix like AllowedIPs: incremental add/remove */
+		parse_ip_prefix(peer, &flags, &mask, WGPEER_REPLACE_ALLOWEDIPS);
 		unsigned long cidr;
 		char *end, *ip;
-
-		parse_ip_prefix(peer, &flags, &mask);
 
 		saved_entry = strdup(mask);
 		if (!saved_entry) {
@@ -433,6 +433,84 @@ err:
 	return false;
 }
 
+static inline bool parse_learnableips(struct wgpeer *peer, struct wgallowedip **last_learnableip, const char *value)
+{
+	struct wgallowedip *allowedip = *last_learnableip, *new_allowedip;
+	char *mask, *mutable = strdup(value), *sep, *saved_entry;
+
+	if (!mutable) {
+		perror("strdup");
+		return false;
+	}
+	peer->flags |= WGPEER_REPLACE_LEARNABLEIPS;
+	if (!strlen(value)) {
+		free(mutable);
+		return true;
+	}
+	sep = mutable;
+	while ((mask = strsep(&sep, ","))) {
+		uint32_t flags = 0;
+		/* If the IP is prefixed with '+' or '-' treat as incremental change */
+		parse_ip_prefix(peer, &flags, &mask, WGPEER_REPLACE_LEARNABLEIPS);
+		unsigned long cidr;
+		char *end, *ip;
+
+		saved_entry = strdup(mask);
+		if (!saved_entry) {
+			perror("strdup");
+			free(mutable);
+			return false;
+		}
+		ip = strsep(&mask, "/");
+
+		new_allowedip = calloc(1, sizeof(*new_allowedip));
+		if (!new_allowedip) {
+			perror("calloc");
+			free(saved_entry);
+			free(mutable);
+			return false;
+		}
+
+		if (!parse_ip(new_allowedip, ip)) {
+			free(new_allowedip);
+			free(saved_entry);
+			free(mutable);
+			return false;
+		}
+
+		if (mask) {
+			if (!char_is_digit(mask[0]))
+				goto err;
+			cidr = strtoul(mask, &end, 10);
+			if (*end || (cidr > 32 && new_allowedip->family == AF_INET) || (cidr > 128 && new_allowedip->family == AF_INET6))
+				goto err;
+		} else if (new_allowedip->family == AF_INET)
+			cidr = 32;
+		else if (new_allowedip->family == AF_INET6)
+			cidr = 128;
+		else
+			goto err;
+		new_allowedip->cidr = cidr;
+		new_allowedip->flags = flags;
+
+		if (allowedip)
+			allowedip->next_allowedip = new_allowedip;
+		else
+			peer->first_learnableip = new_allowedip;
+		allowedip = new_allowedip;
+		free(saved_entry);
+	}
+	free(mutable);
+	*last_learnableip = allowedip;
+	return true;
+err:
+	free(new_allowedip);
+	free(mutable);
+	fprintf(stderr, "LearnableIP is not in the correct format: `%s'\n", saved_entry);
+	free(saved_entry);
+	return false;
+}
+
 static bool process_line(struct config_ctx *ctx, const char *line)
 {
 	const char *value;
@@ -451,6 +529,7 @@ static bool process_line(struct config_ctx *ctx, const char *line)
 			return false;
 		}
 		ctx->last_allowedip = NULL;
+		ctx->last_learnableip = NULL;
 		if (ctx->last_peer)
 			ctx->last_peer->next_peer = new_peer;
 		else
@@ -459,6 +538,7 @@ static bool process_line(struct config_ctx *ctx, const char *line)
 		ctx->is_peer_section = true;
 		ctx->is_device_section = false;
 		ctx->last_peer->flags |= WGPEER_REPLACE_ALLOWEDIPS;
+		ctx->last_peer->flags |= WGPEER_REPLACE_LEARNABLEIPS;
 		return true;
 	}
 
@@ -484,6 +564,8 @@ static bool process_line(struct config_ctx *ctx, const char *line)
 				ctx->last_peer->flags |= WGPEER_HAS_PUBLIC_KEY;
 		} else if (key_match("AllowedIPs"))
 			ret = parse_allowedips(ctx->last_peer, &ctx->last_allowedip, value);
+		else if (key_match("LearnableIPs"))
+			ret = parse_learnableips(ctx->last_peer, &ctx->last_learnableip, value);
 		else if (key_match("PersistentKeepalive"))
 			ret = parse_persistent_keepalive(&ctx->last_peer->persistent_keepalive_interval, &ctx->last_peer->flags, value);
 		else if (key_match("PresharedKey")) {
@@ -590,6 +672,7 @@ struct wgdevice *config_read_cmd(const char *argv[], int argc)
 	struct wgdevice *device = calloc(1, sizeof(*device));
 	struct wgpeer *peer = NULL;
 	struct wgallowedip *allowedip = NULL;
+	struct wgallowedip *learnableip = NULL;
 
 	if (!device) {
 		perror("calloc");
@@ -616,6 +699,7 @@ struct wgdevice *config_read_cmd(const char *argv[], int argc)
 			struct wgpeer *new_peer = calloc(1, sizeof(*new_peer));
 
 			allowedip = NULL;
+			learnableip = NULL;
 			if (!new_peer) {
 				perror("calloc");
 				goto error;
@@ -645,6 +729,18 @@ struct wgdevice *config_read_cmd(const char *argv[], int argc)
 			if (!line)
 				goto error;
 			if (!parse_allowedips(peer, &allowedip, line)) {
+				free(line);
+				goto error;
+			}
+			free(line);
+			argv += 2;
+			argc -= 2;
+		} else if (!strcmp(argv[0], "learnable-ips") && argc >= 2 && peer) {
+			char *line = strip_spaces(argv[1]);
+
+			if (!line)
+				goto error;
+			if (!parse_learnableips(peer, &learnableip, line)) {
 				free(line);
 				goto error;
 			}

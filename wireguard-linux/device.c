@@ -10,6 +10,7 @@
 #include "ratelimiter.h"
 #include "peer.h"
 #include "messages.h"
+#include "learnedips.h"
 
 #include <linux/module.h>
 #include <linux/rtnetlink.h>
@@ -151,13 +152,15 @@ static netdev_tx_t wg_xmit(struct sk_buff *skb, struct net_device *dev)
 	}
 
 	peer = wg_allowedips_lookup_dst(&wg->peer_allowedips, skb);
+	if (!peer && skb->protocol == htons(ETH_P_IPV6))
+		peer = wg_learnedips_lookup(wg, &ipv6_hdr(skb)->daddr);
 	if (unlikely(!peer)) {
 		ret = -ENOKEY;
 		if (skb->protocol == htons(ETH_P_IP))
 			net_dbg_ratelimited("%s: No peer has allowed IPs matching %pI4\n",
 					    dev->name, &ip_hdr(skb)->daddr);
 		else if (skb->protocol == htons(ETH_P_IPV6))
-			net_dbg_ratelimited("%s: No peer has allowed IPs matching %pI6\n",
+			net_dbg_ratelimited("%s: No peer has allowed IPs or learned IPv6 matching %pI6\n",
 					    dev->name, &ipv6_hdr(skb)->daddr);
 		goto err_icmp;
 	}
@@ -258,6 +261,10 @@ static void wg_destruct(struct net_device *dev)
 	wg_packet_queue_free(&wg->handshake_queue, true);
 	wg_packet_queue_free(&wg->decrypt_queue, false);
 	wg_packet_queue_free(&wg->encrypt_queue, false);
+	/* Safety net: free any learned entries not already removed by peer
+	 * teardown (should be empty under normal operation).
+	 */
+	wg_learnedips_table_free(&wg->learned_table);
 	rcu_barrier(); /* Wait for all the peers to be actually freed. */
 	wg_ratelimiter_uninit();
 	memzero_explicit(&wg->static_identity, sizeof(wg->static_identity));
@@ -320,6 +327,8 @@ static int wg_newlink(struct net_device *dev,
 	mutex_init(&wg->socket_update_lock);
 	mutex_init(&wg->device_update_lock);
 	wg_allowedips_init(&wg->peer_allowedips);
+	wg_learnedips_table_init(&wg->learned_table);
+
 	wg_cookie_checker_init(&wg->cookie_checker, wg);
 	INIT_LIST_HEAD(&wg->peer_list);
 	wg->device_update_gen = 1;
@@ -379,6 +388,8 @@ static int wg_newlink(struct net_device *dev,
 	 * register_netdevice doesn't call it for us if it fails.
 	 */
 	dev->priv_destructor = wg_destruct;
+	/* Start periodic GC for learned IPs after successful creation. */
+	wg_learnedips_start_gc(wg);
 
 	pr_debug("%s: Interface created\n", dev->name);
 	return ret;
@@ -401,6 +412,7 @@ err_free_index_hashtable:
 	kvfree(wg->index_hashtable);
 err_free_peer_hashtable:
 	kvfree(wg->peer_hashtable);
+	wg_learnedips_table_free(&wg->learned_table);
 	return ret;
 }
 
