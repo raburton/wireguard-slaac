@@ -1,0 +1,11 @@
+*.o
+*.cmd
+*.ko
+*.mod
+*.order
+*.symvers
+*.mod.c
+*.d
+wireguard-tools/src/wg
+wireguard-linux/include
+
