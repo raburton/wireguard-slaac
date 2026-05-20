@@ -7,15 +7,32 @@
 
 ## Building
 On debian:
-```
-make
-```
+Simply call `make` in the top level folder to build the kernel module and the userspace `wg` tool. You can then use `insmod wireguard-linux/wireguard.ko` to load it, or better yet use `dkms` to build and install the module (a `dmks.conf` file is included). Replace your system `wg` command with the new one, or include it in your path ahead of the system one (wg-quick will need to be calling this new version).
+
 ## Config
-- Add `LearnableIPs = ::/0` to each peer in your config file. This is all you need if you trust your peers, or to get testing.
-- Ideally you'd limit this to link local and your real prefix e.g. `LearnableIPs = fe80::/64, 2a0a:1234:1234:1234/64`.
+- To start, add `LearnableIPs = ::/0` to each peer in your config file. This is all you need if you trust your peers, or to get testing, but ideally you'd limit this to link local and your real prefix e.g. `LearnableIPs = fe80::/64, 2a0a:1234:1234:1234/64`.
 - You need a /64 prefix if you want SLAAC to work.
-- You should add link local (fe80::) because even if you manually assign one to the client with wireguard config, some devices still expect to be able to use SLAAC for this. You need link local to work in order to get router annoucements (RA) advertising your prefix.
-- Public prefixes for SLAAC use are not passed by wireguard (unlike a static address assignment), you need to run something that will provide this (over the link local address), such as `radvd` in unicast mode. e.g.
+- You should add link local addresses (fe80::/64) to the server and (probably) the client. Clients may or may not use SLAAC for link local addressing (even if a static is assigned), so best to allow for both. You need link local to work in order to get router annoucements (RA) advertising your prefix.
+
+- Example `wg0.conf` (relevant bits only):
+```
+[Interface]
+Address = 192.168.0.1/24, fe80::1/64
+ListenPort = 51820
+PrivateKey = xxx
+
+[Peer]
+PublicKey = yyy
+AllowedIPs = 192.168.0.2/32, fe80::2/128
+LearnableIPs = fe80::/64, 2a0a:1234:1234:1234::/64
+
+[Peer]
+PublicKey = zzz
+AllowedIPs = 192.168.0.3/32, fe80::3/128
+LearnableIPs = fe80::/64, 2a0a:1234:1234:1234::/64
+```
+
+- Public prefixes for SLAAC are not passed by wireguard (unlike a static address), you need to run something that will provide this (over the link local address), such as `radvd` in unicast mode. Sample `radvd.conf`:
 ```
 interface wg0
 {
@@ -31,14 +48,29 @@ interface wg0
 ```
 
 ## Running
+Make sure kernel module is loaded, and the new `wg` command is in your path. Then call `wg-quick` to bring up your wireguard interface as normal.
+
+You can then connect a clinet as normal, and view the results with the `wg show` command:
 ```
-rmmod wireguard
-insmod wireguard-linux/wireguard.ko
-export PATH=$PWD/wireguard-tools/src:$PATH
-wg-quick up wg0 (or whichever)
+# wg show
+interface: wg0
+  public key: xxx
+  private key: (hidden)
+  listening port: 51820
+
+peer: yyy
+  endpoint: xxx.xxx.xxx.xxx:yyyyy
+  allowed ips: 192.168.0.2/32, fe80::2/128
+  learnable ips: ::/0, 2a0a:1234:1234:1234::/64
+  learned ips: fe80::6571:fdbe:7912:2919/128, 2a0a:1234:1234:1234:95a5:6e3d:84d0:5565/128
+  latest handshake: 12 seconds ago
+  transfer: 1.72 MiB received, 5.16 MiB sent
+
 ```
 
-## AI generated explanation
+
+
+# AI Generated Explanation
 
 Status
 - Implementation where learned IPv6 source addresses are stored in a dedicated learned-IPs subsystem (hash table + per-peer lists), separate from the AllowedIPs prefix trie.
