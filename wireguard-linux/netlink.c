@@ -492,10 +492,12 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
 
 	if (flags & WGPEER_F_REPLACE_ALLOWEDIPS)
 		wg_allowedips_remove_by_peer(&wg->peer_allowedips, peer,
+					     &peer->allowedips_list,
 					     &wg->device_update_lock);
 
 	if (flags & WGPEER_F_REPLACE_LEARNABLEIPS)
 		wg_allowedips_remove_by_peer(&peer->learnable_ips, peer,
+					     &peer->learnable_allowedips_list,
 					     &wg->device_update_lock);
 
 	if (attrs[WGPEER_A_ALLOWEDIPS]) {

@@ -45,7 +45,8 @@ int wg_allowedips_remove_v4(struct allowedips *table, const struct in_addr *ip,
 int wg_allowedips_remove_v6(struct allowedips *table, const struct in6_addr *ip,
 			    u8 cidr, struct wg_peer *peer, struct mutex *lock);
 void wg_allowedips_remove_by_peer(struct allowedips *table,
-				  struct wg_peer *peer, struct mutex *lock);
+				  struct wg_peer *peer, struct list_head *list,
+				  struct mutex *lock);
 /* The ip input pointer should be __aligned(__alignof(u64))) */
 void swap_endian(u8 *dst, const u8 *src, u8 bits);
 int add(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,

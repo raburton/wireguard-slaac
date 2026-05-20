@@ -91,6 +91,19 @@ static int userspace_set_device(struct wgdevice *dev)
 				continue;
 			fprintf(f, "allowed_ip=%s%s/%d\n", (allowedip->flags & WGALLOWEDIP_REMOVE_ME) ? "-" : "", ip, allowedip->cidr);
 		}
+		if (peer->flags & WGPEER_REPLACE_LEARNABLEIPS)
+			fprintf(f, "replace_learnable_ips=true\n");
+		for (struct wgallowedip *learnable = peer->first_learnableip; learnable; learnable = learnable->next_allowedip) {
+			if (learnable->family == AF_INET) {
+				if (!inet_ntop(AF_INET, &learnable->ip4, ip, INET6_ADDRSTRLEN))
+					continue;
+			} else if (learnable->family == AF_INET6) {
+				if (!inet_ntop(AF_INET6, &learnable->ip6, ip, INET6_ADDRSTRLEN))
+					continue;
+			} else
+				continue;
+			fprintf(f, "learnable_ip=%s%s/%d\n", (learnable->flags & WGALLOWEDIP_REMOVE_ME) ? "-" : "", ip, learnable->cidr);
+		}
 		if (peer->first_learnedip) {
 			for (struct wgallowedip *learned = peer->first_learnedip; learned; learned = learned->next_allowedip) {
 				if (learned->family == AF_INET) {

@@ -372,14 +372,15 @@ int wg_allowedips_remove_v6(struct allowedips *table, const struct in6_addr *ip,
 }
 
 void wg_allowedips_remove_by_peer(struct allowedips *table,
-				  struct wg_peer *peer, struct mutex *lock)
+				  struct wg_peer *peer, struct list_head *list,
+				  struct mutex *lock)
 {
 	struct allowedips_node *node, *tmp;
 
-	if (list_empty(&peer->allowedips_list))
+	if (list_empty(list))
 		return;
 	++table->seq;
-	list_for_each_entry_safe(node, tmp, &peer->allowedips_list, peer_list)
+	list_for_each_entry_safe(node, tmp, list, peer_list)
 		__wg_allowedips_remove_node(table, node, lock);
 }
 
