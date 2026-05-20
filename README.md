@@ -17,7 +17,7 @@ Simply call `make` in the top level folder to build the kernel module and the us
 - Example `wg0.conf` (relevant bits only):
 ```
 [Interface]
-Address = 192.168.0.1/24, fe80::1/64
+Address = 192.168.0.1/24, fe80::1/64, 2a0a:1234:1234:1234::1/64
 ListenPort = 51820
 PrivateKey = xxx
 
