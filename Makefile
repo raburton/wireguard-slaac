@@ -19,6 +19,7 @@ clean:
 	@rm -f $(PWD)/wireguard-linux/include/uapi/linux/wireguard.h || true
 	@rmdir --ignore-fail-on-non-empty $(PWD)/wireguard-linux/include/uapi/linux 2>/dev/null || true
 	@rmdir --ignore-fail-on-non-empty $(PWD)/wireguard-linux/include/uapi 2>/dev/null || true
+	@rmdir --ignore-fail-on-non-empty $(PWD)/wireguard-linux/include 2>/dev/null || true
 	$(MAKE) -C wireguard-tools/src clean
 
 .PHONY: all kernel tools clean
