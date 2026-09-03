@@ -16,12 +16,6 @@
 
 static struct kmem_cache *learned_cache;
 
-static void learned_entry_free_rcu(struct rcu_head *rcu)
-{
-	kmem_cache_free(learned_cache,
-			container_of(rcu, struct wg_learned_entry, rcu));
-}
-
 /* Hash an IPv6 address to a u32 key for use with the kernel hashtable API. */
 static inline u32 addr_key(const struct in6_addr *addr)
 {
@@ -65,7 +59,7 @@ static void learnedips_gc_worker(struct work_struct *work)
 			list_del(&entry->peer_list);
 			if (owner)
 				--owner->learned_count;
-			call_rcu(&entry->rcu, learned_entry_free_rcu);
+			kfree_rcu(entry, rcu);
 		}
 	}
 	spin_unlock_bh(&tbl->lock);
@@ -104,7 +98,7 @@ void wg_learnedips_table_free(struct wg_learned_table *tbl)
 	spin_lock_bh(&tbl->lock);
 	hash_for_each_safe(tbl->table, bkt, tmp, entry, hash_node) {
 		hash_del_rcu(&entry->hash_node);
-		call_rcu(&entry->rcu, learned_entry_free_rcu);
+		kfree_rcu(entry, rcu);
 	}
 	spin_unlock_bh(&tbl->lock);
 }
@@ -225,7 +219,7 @@ bool wg_learnedips_learn(struct wg_device *wg, struct wg_peer *peer,
 			hash_del_rcu(&victim->hash_node);
 			list_del(&victim->peer_list);
 			--peer->learned_count;
-			call_rcu(&victim->rcu, learned_entry_free_rcu);
+			kfree_rcu(victim, rcu);
 		}
 	}
 
@@ -282,7 +276,7 @@ void wg_learnedips_remove_by_peer(struct wg_device *wg, struct wg_peer *peer)
 		hash_del_rcu(&entry->hash_node);
 		list_del(&entry->peer_list);
 		--peer->learned_count;
-		call_rcu(&entry->rcu, learned_entry_free_rcu);
+		kfree_rcu(entry, rcu);
 	}
 	spin_unlock_bh(&tbl->lock);
 }
